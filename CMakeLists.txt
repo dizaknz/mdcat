@@ -21,12 +21,19 @@ else()
   set(MD4C_INCLUDE_DIR "${md4c_SOURCE_DIR}/src")
 endif()
 
-add_library(mdcat_ascii STATIC src/ascii/glyphs.cpp src/ascii/canvas.cpp src/text.cpp)
-target_include_directories(mdcat_ascii PUBLIC include)
+add_library(mdcat_ascii STATIC
+  src/ascii/glyphs.cpp
+  src/ascii/canvas.cpp
+  src/ascii/pager.cpp
+  src/text.cpp)
+target_include_directories(mdcat_ascii PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 add_library(mdcat_mermaid STATIC
-  src/mermaid/mermaid.cpp src/mermaid/labels.cpp src/mermaid/flowchart.cpp
-  src/mermaid/sequence.cpp src/mermaid/pie.cpp)
+  src/mermaid/mermaid.cpp
+  src/mermaid/labels.cpp
+  src/mermaid/flowchart.cpp
+  src/mermaid/sequence.cpp
+  src/mermaid/pie.cpp)
 target_link_libraries(mdcat_mermaid PUBLIC mdcat_ascii)
 
 add_library(mdcat_md STATIC src/md/terminal_renderer.cpp)
@@ -34,7 +41,7 @@ target_include_directories(mdcat_md PRIVATE "${MD4C_INCLUDE_DIR}")
 target_link_libraries(mdcat_md PUBLIC mdcat_ascii PRIVATE md4c)
 
 add_executable(mdcat app/main.cpp)
-target_link_libraries(mdcat PRIVATE mdcat_md mdcat_mermaid)
+target_link_libraries(mdcat PRIVATE mdcat_md mdcat_mermaid mdcat_ascii)
 if(MSVC)
   foreach(t mdcat mdcat_ascii mdcat_mermaid mdcat_md)
     target_compile_options(${t} PRIVATE /utf-8 /EHsc)

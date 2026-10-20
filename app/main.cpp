@@ -4,10 +4,12 @@
 #ifdef _WIN32
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
+#include <conio.h>
 #include <io.h>
 #include <windows.h>
 #else
 #include <sys/ioctl.h>
+#include <termios.h>
 #include <unistd.h>
 #endif
 
@@ -24,6 +26,7 @@
 #include "md/terminal_renderer.h"
 #include "mermaid/mermaid.h"
 #include "text.h"
+#include "ascii/pager.h"
 
 namespace {
 
@@ -87,8 +90,20 @@ void usage() {
         "  -C, --no-color    disable ANSI colors (NO_COLOR is also honoured)\n"
         "  -m, --no-mermaid  show mermaid blocks as source instead of rendering them\n"
         "  -u, --no-urls     do not print link targets after link text\n"
+        "  -p, --pager       use pager mode (default, can be disabled with --no-pager)\n"
+        "  --no-pager        disable pager mode\n"
         "  -h, --help        show this help\n"
         "  -V, --version     show version\n"
+        "\n"
+        "Pager Controls:\n"
+        "  ↑ / Ctrl+P        scroll up\n"
+        "  ↓ / Ctrl+N        scroll down\n"
+        "  Page Up           scroll page up\n"
+        "  Page Down         scroll page down\n"
+        "  Home / Ctrl+A     jump to top\n"
+        "  End / Ctrl+E      jump to bottom\n"
+        "  q                 quit pager\n"
+        "  Ctrl+C            quit pager\n"
         "\n"
         "Files ending in .mmd or .mermaid are rendered as a single Mermaid diagram.\n"
         "Mermaid support: flowchart/graph, sequenceDiagram, stateDiagram(-v2), pie."
@@ -100,10 +115,66 @@ void usage() {
 constexpr std::string_view app = "mdcat";
 constexpr std::string_view version = "1.0.0";
 
+// Blocks until a key is pressed. Returns the raw key bytes; special keys are
+// returned as ANSI escape sequences (e.g. "\x1b[A" for Up).
+std::string get_key() {
+#ifdef _WIN32
+    int c = _getch();
+    if (c == 0 || c == 0xE0) {          // extended key: prefix + scan code
+        switch (_getch()) {
+            case 72: return "\x1b[A";       // Up
+            case 80: return "\x1b[B";       // Down
+            case 73: return "\x1b[5~";      // Page Up
+            case 81: return "\x1b[6~";      // Page Down
+            case 71: return "\x1b[H";       // Home
+            case 79: return "\x1b[F";       // End
+        default: return std::string();  // ignore other extended keys
+        }
+    }
+    return std::string(1, static_cast<char>(c)); // 'q', Ctrl+C (0x03), Ctrl+P, ...
+#else
+    struct termios oldt;
+    if (tcgetattr(STDIN_FILENO, &oldt) != 0)
+        return std::string();
+
+    struct termios newt = oldt;
+    newt.c_lflag &= ~(ICANON | ECHO | ISIG); // ISIG off: Ctrl+C arrives as "\x03"
+    newt.c_cc[VMIN] = 1;                     // block until at least 1 byte
+    newt.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+
+    char buf[8] = {0};
+    ssize_t n = read(STDIN_FILENO, buf, sizeof(buf)); // returns whatever one keypress produced
+
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+
+    return n > 0 ? std::string(buf, static_cast<size_t>(n)) : std::string();
+#endif
+}
+
+std::vector<std::string> splitLines(const std::string &s) {
+    std::vector<std::string> out;
+    std::string::size_type pos = 0;
+    while (pos <= s.size()) {
+        auto nl = s.find('\n', pos);
+        if (nl == std::string::npos) {
+            if (pos < s.size())
+                out.push_back(s.substr(pos));
+            break;
+        }
+        std::string line = s.substr(pos, nl - pos);
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        out.push_back(std::move(line));
+        pos = nl + 1;
+    }
+    return out;
+}
+
 int main(int argc, char **argv) {
     std::vector<std::string> files;
     int width = 0;
-    bool forceColor = false, noColor = false, ascii = false, mermaidOn = true, urls = true;
+    bool forceColor = false, noColor = false, ascii = false, mermaidOn = true, urls = true, usePager = true;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--") {
@@ -137,6 +208,10 @@ int main(int argc, char **argv) {
             mermaidOn = false;
         else if (a == "-u" || a == "--no-urls")
             urls = false;
+        else if (a == "-p" || a == "--pager")
+            usePager = true;
+        else if (a == "--no-pager")
+            usePager = false;
         else if (a == "-")
             files.push_back(a);
         else if (a.size() > 1 && a[0] == '-') {
@@ -176,6 +251,8 @@ int main(int argc, char **argv) {
 
     int rc = 0;
     bool first = true;
+    std::vector<std::string> all_lines;
+    
     for (auto &path : files) {
         std::string data;
         if (!readAll(path, data)) {
@@ -185,13 +262,56 @@ int main(int argc, char **argv) {
         }
         std::string lp = text::toLower(path);
         if (hasSuffix(lp, ".mmd") || hasSuffix(lp, ".mermaid"))
-            data = "~~~~mermaid\n" + data + "\n~~~~\n";
+            data = "~~~~mermaid\n" + data + "~~~~\n";
         std::string rendered = renderer.render(data);
-        if (!first && !rendered.empty())
-            fputc('\n', stdout);
-        fwrite(rendered.data(), 1, rendered.size(), stdout);
-        if (!rendered.empty())
+        if (!rendered.empty()) {
+            if (!first)
+                all_lines.push_back("");          // separator goes *before* the next file
+            auto lines = splitLines(rendered);
+            all_lines.insert(all_lines.end(),
+                             std::make_move_iterator(lines.begin()),
+                             std::make_move_iterator(lines.end()));
             first = false;
+        }
     }
+    
+    if (all_lines.empty()) {
+        fprintf(stderr, "mdcat: no content to display\n");
+        return 1;
+    }
+    
+    if (usePager) {
+        ascii::init();
+        ascii::PagerState state;
+        state.lines = std::move(all_lines);
+        state.start = 0;
+        state.end = std::max<long long>(0LL, state.lines.size() - 1);
+        state.at_top = true;
+        state.at_bottom = false;
+        
+        ascii::PagerOptions pager_opts;
+        pager_opts.wrap_at_edge = true;
+        pager_opts.show_cursor = true;
+        
+        bool quit = false;
+        
+        while (!quit) {
+            ascii::render(state, pager_opts);
+            
+            std::string key = get_key();
+            bool should_quit = false;
+            ascii::Key pressed = ascii::handle_key(state, key, should_quit);
+            if (should_quit || pressed == ascii::Key::QUIT) {
+                quit = true;
+            }
+        }
+        
+        ascii::cleanup();
+    } else {
+        for (const auto &line : all_lines) {
+            std::cout << line << "\n";
+        }
+    }
+    
     return rc;
 }
